@@ -1,81 +1,122 @@
 import { MedusaRequest, MedusaResponse } from "@medusajs/framework";
 import { ContainerRegistrationKeys } from "@medusajs/framework/utils";
-import { number } from "prop-types";
+
+// Definicja interfejsów typów
+interface CustomerLink {
+  customer_id: string;
+  review_id: string;
+  id: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
+interface Review {
+  id: string;
+  title: string;
+  content: string;
+  status: "approved" | "rejected";
+  rating: number;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  customer_link: CustomerLink[];
+  customer_name?: string;
+}
+
+interface Product {
+  id: string;
+  review: Review[];
+}
+
+interface Customer {
+  id: string;
+  first_name: string;
+  last_name: string;
+}
 
 export const GET = async (req: MedusaRequest, res: MedusaResponse) => {
   const product_id = req.params.id;
-
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY);
 
-  // Pobierz recenzje produktu
-  const { data: reviewsOfProduct } = await query.graph({
-    entity: "product",
-    fields: ["review.*", "review.customer_link.*"],
-    filters: {
-      id: product_id,
-    },
-  });
+  try {
+    // Pobierz recenzje produktu z walidacją typu
+    const { data: reviewsOfProduct } = await query.graph<Product[]>({
+      entity: "product",
+      fields: ["review.*", "review.customer_link.*"],
+      filters: { id: product_id },
+    });
 
-  // remove all null reviews
-  const filteredReviews = reviewsOfProduct.filter((product: any) => {
-    product.review = product.review.filter((review: any) => review != null);
-    return product.review.length > 0;
-  });
-
-  // Stwórz listę customer_id do pobrania danych klientów
-  const customerIds = filteredReviews.flatMap((product: any) =>
-    product.review.flatMap((review) =>
-      review.customer_link.map((link) => link.customer_id)
-    )
-  );
-
-  // Pobierz dane klientów na podstawie ich ID
-  const uniqueCustomerIds = [...new Set(customerIds)]; // Usuń duplikaty ID klientów
-  const customers = await query.graph({
-    entity: "customer",
-    fields: ["id", "first_name", "last_name"],
-    filters: {
-      id: uniqueCustomerIds,
-    },
-  });
-
-  const customerMap = new Map(
-    customers.data.map((customer) => [customer.id, customer])
-  );
-
-  // Dodaj imię i nazwisko klienta do każdej recenzji
-  for (const product of reviewsOfProduct) {
-    for (const review of product.review) {
-      const customerLink = review.customer_link?.[0];
-      if (customerLink) {
-        const customer = customerMap.get(customerLink.customer_id);
-        if (customer) {
-          review.customer_name = `${
-            customer.first_name
-          } ${customer.last_name.charAt(0)}`;
-        }
-      }
-    }
-  }
-
-  // Return only approved reviews
-  const onlyApprovedReviews = reviewsOfProduct.map((product) => {
-    product.review = product.review.filter(
-      (review) => review.status === "approved"
+    // Filtruj nieprawidłowe recenzje i produkty
+    const validProducts = reviewsOfProduct.filter(
+      (product): product is Product => !!product?.review
     );
-    return product;
-  });
 
-  const reviews = onlyApprovedReviews.flatMap((product: any) => product.review);
+    // Zbierz unikalne ID klientów z zachowaniem typów
+    const customerIds = validProducts
+      .flatMap((product) =>
+        product.review.flatMap((review) =>
+          review.customer_link.map((link) => link.customer_id)
+        )
+      )
+      .filter((id): id is string => !!id);
 
-  // Calculate average rating
-  const average_rating =
-    reviews.reduce((acc: number, review: any) => acc + review.rating, 0) /
-    reviews.length;
+    const uniqueCustomerIds = [...new Set(customerIds)];
 
-  res.status(200).json({
-    reviews: onlyApprovedReviews,
-    average_rating: average_rating,
-    number_of_reviews: reviews.length,
-  });
+    // Pobierz dane klientów z walidacją typu
+    const { data: customers } = await query.graph<Customer[]>({
+      entity: "customer",
+      fields: ["id", "first_name", "last_name"],
+      filters: { id: uniqueCustomerIds },
+    });
+
+    // Utwórz mapę klientów z bezpiecznym typowaniem
+    const customerMap = new Map<string, Customer>(
+      customers.map((customer) => [customer.id, customer])
+    );
+
+    // Dodaj nazwę klienta do recenzji (niemutująca wersja)
+    const productsWithCustomerNames = validProducts.map((product) => ({
+      ...product,
+      review: product.review.map((review) => {
+        const customerId = review.customer_link[0]?.customer_id;
+        const customer = customerId ? customerMap.get(customerId) : undefined;
+
+        return {
+          ...review,
+          customer_name: customer
+            ? `${customer.first_name} ${customer.last_name.charAt(0)}.`
+            : "Anonymous",
+        };
+      }),
+    }));
+
+    // Filtruj i przetwarzaj recenzje (niemutująco)
+    const approvedReviews = productsWithCustomerNames
+      .map((product) => ({
+        ...product,
+        review: product.review.filter((review) => review.status === "approved"),
+      }))
+      .filter((product) => product.review.length > 0);
+
+    // Oblicz statystyki z zabezpieczeniem przed NaN
+    const allReviews = approvedReviews.flatMap((product) => product.review);
+    const totalRating = allReviews.reduce(
+      (acc, review) => acc + review.rating,
+      0
+    );
+    const averageRating =
+      allReviews.length > 0
+        ? Number((totalRating / allReviews.length).toFixed(1))
+        : 0;
+
+    res.status(200).json({
+      reviews: approvedReviews,
+      average_rating: averageRating,
+      number_of_reviews: allReviews.length,
+    });
+  } catch (error) {
+    console.error("Error fetching reviews:", error);
+    res.status(500).json({ message: "Internal server error" });
+  }
 };
