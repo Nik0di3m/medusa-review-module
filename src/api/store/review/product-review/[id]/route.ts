@@ -40,83 +40,78 @@ export const GET = async (req: MedusaRequest, res: MedusaResponse) => {
   const query = req.scope.resolve(ContainerRegistrationKeys.QUERY);
 
   try {
-    // Pobierz recenzje produktu z walidacją typu
-    const { data: reviewsOfProduct } = await query.graph<Product[]>({
+    // Pobierz recenzje produktu
+    const { data: products } = await query.graph<Product[]>({
       entity: "product",
       fields: ["review.*", "review.customer_link.*"],
       filters: { id: product_id },
     });
 
-    // Filtruj nieprawidłowe recenzje i produkty
-    const validProducts = reviewsOfProduct.filter(
-      (product): product is Product => !!product?.review
-    );
+    // Pobierz pierwszy i jedyny produkt (ponieważ filtrujemy po ID)
+    const singleProduct = products[0] || { id: product_id, review: [] };
 
-    // Zbierz unikalne ID klientów z zachowaniem typów
-    const customerIds = validProducts
-      .flatMap((product) =>
-        product.review.flatMap((review) =>
-          review.customer_link.map((link) => link.customer_id)
-        )
-      )
+    // Zbierz unikalne ID klientów
+    const customerIds = singleProduct.review
+      .flatMap((review) => review.customer_link.map((link) => link.customer_id))
       .filter((id): id is string => !!id);
 
     const uniqueCustomerIds = [...new Set(customerIds)];
 
-    // Pobierz dane klientów z walidacją typu
+    // Pobierz dane klientów
     const { data: customers } = await query.graph<Customer[]>({
       entity: "customer",
       fields: ["id", "first_name", "last_name"],
       filters: { id: uniqueCustomerIds },
     });
 
-    // Utwórz mapę klientów z bezpiecznym typowaniem
+    // Utwórz mapę klientów
     const customerMap = new Map<string, Customer>(
       customers.map((customer) => [customer.id, customer])
     );
 
-    // Dodaj nazwę klienta do recenzji (niemutująca wersja)
-    const productsWithCustomerNames = validProducts.map((product) => ({
-      ...product,
-      review: product.review.map((review) => {
-        const customerId = review.customer_link[0]?.customer_id;
-        const customer = customerId ? customerMap.get(customerId) : undefined;
+    // Dodaj nazwy klientów do recenzji
+    const processedReviews = singleProduct.review.map((review) => {
+      const customerId = review.customer_link[0]?.customer_id;
+      const customer = customerId ? customerMap.get(customerId) : undefined;
 
-        return {
-          ...review,
-          customer_name: customer
-            ? `${customer.first_name} ${customer.last_name.charAt(0)}.`
-            : "Anonymous",
-        };
-      }),
-    }));
+      return {
+        ...review,
+        customer_name: customer
+          ? `${customer.first_name} ${customer.last_name.charAt(0)}.`
+          : "Anonymous",
+      };
+    });
 
-    // Filtruj i przetwarzaj recenzje (niemutująco)
-    const approvedReviews = productsWithCustomerNames
-      .map((product) => ({
-        ...product,
-        review: product.review.filter((review) => review.status === "approved"),
-      }))
-      .filter((product) => product.review.length > 0);
+    // Filtruj zatwierdzone recenzje
+    const approvedReviews = processedReviews.filter(
+      (review) => review.status === "approved"
+    );
 
-    // Oblicz statystyki z zabezpieczeniem przed NaN
-    const allReviews = approvedReviews.flatMap((product) => product.review);
-    const totalRating = allReviews.reduce(
+    // Oblicz statystyki
+    const totalRating = approvedReviews.reduce(
       (acc, review) => acc + review.rating,
       0
     );
     const averageRating =
-      allReviews.length > 0
-        ? Number((totalRating / allReviews.length).toFixed(1))
+      approvedReviews.length > 0
+        ? Number((totalRating / approvedReviews.length).toFixed(1))
         : 0;
 
+    // Zwróć sformatowaną odpowiedź z pojedynczym obiektem
     res.status(200).json({
+      product_id: product_id,
       reviews: approvedReviews,
       average_rating: averageRating,
-      number_of_reviews: allReviews.length,
+      number_of_reviews: approvedReviews.length,
     });
   } catch (error) {
     console.error("Error fetching reviews:", error);
-    res.status(500).json({ message: "Internal server error" });
+    res.status(500).json({
+      product_id: product_id,
+      message: "Internal server error",
+      reviews: null,
+      average_rating: 0,
+      number_of_reviews: 0,
+    });
   }
 };
